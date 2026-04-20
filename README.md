@@ -228,30 +228,96 @@ Difficulté : Moyenne (~45 minutes)
 **Complétez et documentez ce fichier README.md** pour répondre aux questions des exercices.  
 Faites preuve de pédagogie et soyez clair dans vos explications et procedures de travail.  
 
-**Exercice 1 :**  
-Quels sont les composants dont la perte entraîne une perte de données ?  
-  
-*..Répondez à cet exercice ici..*
+### Exercice 1 : Quels sont les composants dont la perte entraîne une perte de données ?
 
-**Exercice 2 :**  
-Expliquez nous pourquoi nous n'avons pas perdu les données lors de la supression du PVC pra-data  
-  
-*..Répondez à cet exercice ici..*
+Les deux composants dont la perte provoque une perte de données sont les **PVC (Persistent Volume Claims)** :
 
-**Exercice 3 :**  
-Quels sont les RTO et RPO de cette solution ?  
-  
-*..Répondez à cet exercice ici..*
+- **`pra-data`** : ce PVC contient la base de données SQLite en production. Sa perte signifie la perte de toutes les données actuelles de l'application. C'est exactement ce que nous avons simulé dans le scénario 2.
+- **`pra-backup`** : ce PVC contient les copies de sauvegarde de la BDD. Si ce volume est perdu **en même temps** que `pra-data`, il n'existe plus aucun moyen de restaurer les données. C'est le point de défaillance ultime de cette architecture.
 
-**Exercice 4 :**  
-Pourquoi cette solution (cet atelier) ne peux pas être utilisé dans un vrai environnement de production ? Que manque-t-il ?   
-  
-*..Répondez à cet exercice ici..*
-  
-**Exercice 5 :**  
-Proposez une archtecture plus robuste.   
-  
-*..Répondez à cet exercice ici..*
+> ⚠️ En revanche, la perte d'un **pod** n'entraîne **aucune perte de données**. Le pod ne stocke rien de persistant : la BDD est montée depuis le PVC `pra-data`, et Kubernetes recrée automatiquement le pod via le `Deployment`. C'est ce que nous avons observé dans le scénario 1 (PCA).
+
+---
+
+### Exercice 2 : Pourquoi n'avons-nous pas perdu les données lors de la suppression du PVC `pra-data` ?
+
+Lors du scénario 2, nous avons supprimé le PVC `pra-data` (la base de données de production), mais nous n'avons **pas perdu les données** grâce au **mécanisme de sauvegarde automatique** :
+
+1. Un **CronJob Kubernetes** (`sqlite-backup`) s'exécute **toutes les minutes** et copie le fichier de base de données depuis le PVC `pra-data` vers le PVC `pra-backup`.
+2. Au moment du sinistre, le PVC `pra-backup` contenait donc déjà une ou plusieurs **copies récentes** de la BDD.
+3. La procédure de restauration (`pra/50-job-restore.yaml`) lance un **Job** qui copie la sauvegarde la plus récente depuis `pra-backup` vers le nouveau PVC `pra-data` vide.
+
+C'est donc la **redondance des données sur un second volume** (`pra-backup`), combinée à une **procédure de restauration manuelle**, qui nous a permis de récupérer l'intégralité des données.
+
+---
+
+### Exercice 3 : Quels sont les RTO et RPO de cette solution ?
+
+#### RPO (Recovery Point Objective) — Quantité maximale de données que l'on accepte de perdre
+
+Le CronJob de sauvegarde s'exécute **toutes les minutes**. Dans le pire cas, le sinistre survient juste avant la prochaine sauvegarde planifiée.
+
+> **RPO ≈ 1 minute** : on peut perdre au maximum les données écrites durant la dernière minute écoulée depuis le dernier backup.
+
+#### RTO (Recovery Time Objective) — Durée nécessaire pour rétablir le service
+
+La restauration nécessite plusieurs étapes **manuelles** :
+
+1. Recréer le PVC vide : `kubectl apply -f k8s/`
+2. Lancer le job de restauration : `kubectl apply -f pra/50-job-restore.yaml`
+3. Relancer le `port-forward` et réactiver le CronJob de sauvegarde
+
+> **RTO ≈ 2 à 5 minutes** : dépend de la réactivité de l'opérateur et de la taille de la BDD à restaurer.
+
+---
+
+### Exercice 4 : Pourquoi cette solution ne peut pas être utilisée en production ? Que manque-t-il ?
+
+Plusieurs limites rendent cette architecture inappropriée pour un vrai environnement de production :
+
+- **Sauvegarde locale, pas de réplication distante** : les deux PVC (`pra-data` et `pra-backup`) résident sur le **même cluster K3d**, potentiellement sur le même nœud physique. Un sinistre physique (incendie, panne matérielle globale) entraînerait la **perte simultanée des deux volumes**. Il faudrait une réplication hors-site (stockage objet distant type **S3**, NAS externe, ou un second cluster dans une autre zone/région).
+
+- **SQLite n'est pas adapté à la production** : `SQLite` ne supporte pas les accès concurrents en écriture et ne passe pas à l'échelle. En production, on utiliserait **PostgreSQL**, **MySQL** ou un service managé (RDS, Cloud SQL…).
+
+- **Restauration entièrement manuelle** : la procédure de PRA nécessite une **intervention humaine**. Il n'y a aucun mécanisme de détection automatique du sinistre ni de bascule automatique (failover).
+
+- **Pas de haute disponibilité applicative** : un seul replica du `Deployment` Flask est déployé. En production, on aurait **plusieurs replicas** répartis sur différents nœuds avec un load balancer.
+
+- **Pas de chiffrement ni de contrôle d'accès sur les backups** : les sauvegardes ne sont ni chiffrées, ni protégées par des politiques de rétention ou d'accès.
+
+- **Pas de supervision ni d'alerting** : aucun monitoring (`Prometheus`, `Grafana`) ni système d'alerte (`PagerDuty`, `OpsGenie`) pour détecter une panne ou un échec de sauvegarde.
+
+---
+
+### Exercice 5 : Proposez une architecture plus robuste
+
+#### Base de données
+
+Remplacer `SQLite` par **PostgreSQL** déployé en haute disponibilité (par exemple via l'opérateur **CloudNativePG** ou **Patroni**) avec réplication synchrone entre un primaire et au moins un réplica, répartis sur des nœuds différents.
+
+#### Sauvegarde externalisée
+
+Les backups ne doivent plus rester dans le même cluster. Utiliser un outil comme **pgBackRest** ou **Velero** pour envoyer les sauvegardes vers un **stockage objet distant** (AWS S3, MinIO sur un site secondaire, Azure Blob…). Appliquer une politique de rétention (par exemple : backups horaires conservés 24h, quotidiens conservés 30 jours).
+
+#### Multi-zone / multi-cluster
+
+Déployer le cluster Kubernetes sur au moins **deux zones de disponibilité** (ou deux datacenters). En cas de perte d'une zone, le trafic est automatiquement routé vers la zone survivante.
+
+#### Haute disponibilité applicative
+
+Déployer **plusieurs replicas** du pod Flask avec un **Ingress Controller** ou un `LoadBalancer` en frontal, couplé à des **PodDisruptionBudgets** pour garantir un minimum de pods disponibles pendant les mises à jour ou les pannes.
+
+#### Failover automatique
+
+Mettre en place un mécanisme de bascule automatique. L'opérateur PostgreSQL gère le failover de la BDD. Pour l'application, le `Service` Kubernetes répartit automatiquement le trafic sur les pods sains.
+
+#### Monitoring et alerting
+
+Déployer **Prometheus + Grafana** pour la supervision, avec des alertes (via `Alertmanager` vers Slack, PagerDuty…) sur les métriques critiques : état des pods, espace disque des PVC, succès/échec des CronJobs de backup, latence applicative.
+
+#### Chiffrement et sécurité
+
+Chiffrer les backups au repos et en transit, appliquer des **NetworkPolicies** pour isoler les namespaces, et utiliser des **RBAC** stricts pour limiter l'accès aux PVC et aux opérations sensibles.
 
 ---------------------------------------------------
 Séquence 6 : Ateliers  
