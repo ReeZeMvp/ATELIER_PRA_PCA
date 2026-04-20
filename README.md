@@ -335,7 +335,115 @@ Difficulté : Moyenne (~2 heures)
 ### **Atelier 2 : Choisir notre point de restauration**  
 Aujourd’hui nous restaurobs “le dernier backup”. Nous souhaitons **ajouter la capacité de choisir un point de restauration**.
 
-*..Décrir ici votre procédure de restauration (votre runbook)..*  
+### Atelier 2 : Choisir notre point de restauration
+
+#### Problème
+
+Le job `pra/50-job-restore.yaml` restaure systématiquement le **dernier backup** disponible (`ls -t | head -1`). En situation réelle, le dernier backup peut lui-même contenir des données corrompues (par exemple si la corruption a eu lieu avant la sauvegarde). Il faut donc pouvoir **choisir un point de restauration précis**.
+
+#### Solution
+
+Un nouveau job `pra/51-job-restore-selective.yaml` accepte une variable d'environnement `BACKUP_FILE` qui permet de spécifier le fichier de backup à restaurer. Si aucun fichier n'est spécifié, le comportement par défaut reste la restauration du dernier backup.
+
+#### Runbook — Procédure de restauration sélective
+
+##### Étape 1 — Lister les backups disponibles
+
+Lancer un pod temporaire pour consulter les fichiers de sauvegarde présents dans le PVC `pra-backup` :
+
+```bash
+kubectl -n pra run debug-backup \
+  --rm -it \
+  --image=alpine \
+  --overrides='{
+    "spec": {
+      "containers": [{
+        "name": "debug",
+        "image": "alpine",
+        "command": ["sh", "-c", "ls -lh /backup/ && echo && echo Nombre de backups: $(ls /backup/*.db | wc -l)"],
+        "volumeMounts": [{"name": "backup", "mountPath": "/backup"}]
+      }],
+      "volumes": [{
+        "name": "backup",
+        "persistentVolumeClaim": {"claimName": "pra-backup"}
+      }]
+    }
+  }'
+```
+
+Exemple de sortie :
+```
+-rw-r--r--  1 root root  12K  app-1776690000.db
+-rw-r--r--  1 root root  12K  app-1776690060.db
+-rw-r--r--  1 root root  16K  app-1776690120.db
+-rw-r--r--  1 root root  16K  app-1776691261.db
+
+Nombre de backups: 4
+```
+
+> Le timestamp Unix dans le nom de fichier correspond à l'heure de la sauvegarde. Pour convertir un timestamp en date lisible : `date -d @1776691261`
+
+##### Étape 2 — Choisir le point de restauration
+
+Identifier le fichier souhaité dans la liste. Par exemple, si on veut revenir à l'état de `app-1776690120.db`.
+
+##### Étape 3 — Arrêter l'application et les sauvegardes
+
+```bash
+# Stopper le pod Flask
+kubectl -n pra scale deployment flask --replicas=0
+
+# Suspendre le CronJob de sauvegarde
+kubectl -n pra patch cronjob sqlite-backup -p '{"spec":{"suspend":true}}'
+```
+
+##### Étape 4 — Supprimer l'ancien job de restauration (si existant)
+
+```bash
+kubectl -n pra delete job sqlite-restore-selective --ignore-not-found
+```
+
+##### Étape 5 — Lancer la restauration avec le fichier choisi
+
+Utiliser `sed` pour injecter le nom du fichier dans le job, puis l'appliquer :
+
+```bash
+sed 's/__BACKUP_FILE__/app-1776690120.db/' pra/51-job-restore-selective.yaml | kubectl apply -f -
+```
+
+Vérifier que le job s'est terminé avec succès :
+
+```bash
+kubectl -n pra logs job/sqlite-restore-selective
+```
+
+Sortie attendue :
+```
+=== Restauration sélective ===
+Restauration de : /backup/app-1776690120.db
+Restauration terminée avec succès.
+```
+
+##### Étape 6 — Relancer l'application et les sauvegardes
+
+```bash
+# Relancer le pod Flask
+kubectl -n pra scale deployment flask --replicas=1
+
+# Réactiver le CronJob
+kubectl -n pra patch cronjob sqlite-backup -p '{"spec":{"suspend":false}}'
+
+# Relancer le port-forward
+kubectl -n pra port-forward svc/flask 8080:80 >/tmp/web.log 2>&1 &
+```
+
+##### Étape 7 — Vérification
+
+Accéder à l'application et confirmer que les données correspondent bien au point de restauration choisi :
+
+- `https://.../count` → vérifier le nombre de messages
+- `https://.../consultation` → vérifier le contenu des messages
+- `https://.../status` → vérifier que le backup tourne à nouveau 
   
 ---------------------------------------------------
 Evaluation

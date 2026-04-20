@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sqlite-restore-selective
+  namespace: pra
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: restore
+          image: alpine
+          env:
+            - name: BACKUP_FILE
+              value: "__BACKUP_FILE__"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              echo "=== Restauration sélective ==="
+              if [ "$BACKUP_FILE" = "__BACKUP_FILE__" ] || [ -z "$BACKUP_FILE" ]; then
+                echo "Aucun fichier spécifié, restauration du dernier backup..."
+                TARGET=$(ls -t /backup/*.db | head -1)
+              else
+                TARGET="/backup/$BACKUP_FILE"
+              fi
+
+              if [ ! -f "$TARGET" ]; then
+                echo "ERREUR : fichier $TARGET introuvable."
+                ls -lh /backup/
+                exit 1
+              fi
+
+              echo "Restauration de : $TARGET"
+              cp "$TARGET" /data/app.db
+              echo "Restauration terminée avec succès."
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: backup
+              mountPath: /backup
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pra-data
+        - name: backup
+          persistentVolumeClaim:
+            claimName: pra-backup
