@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: flask
-          image: pra/flask-sqlite:1.0
+          image: pra/flask-sqlite:2.0
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_PATH
@@ -29,7 +29,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: backup
+              mountPath: /backup
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: pra-data
+        - name: backup
+          persistentVolumeClaim:
+            claimName: pra-backup
